@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Fake `adb` that behaves like a TCL Google TV, for testing tvtool.py offline."""
+import json, os, random, re, sys
+
+ST = os.environ["MOCK_STATE"]
+STOCK = "com.google.android.apps.tv.launcherx"
+WRAITH = "com.google.android.tungsten.setupwraith"
+
+def load():
+    if os.path.exists(ST):
+        return json.load(open(ST))
+    system = ["android", "com.android.systemui", "com.android.tv.settings", "com.google.android.gms",
+              "com.tcl.waterfall.overseas", "com.tcl.channelplus", "com.tcl.useragreement", "com.tcl.miracast",
+              "com.tcl.suspension", "com.tcl.tv", "com.tcl.tvinput", "com.tcl.tcl_bt_rcu_service", "com.tcl.autopair",
+              "com.tcl.guard", "com.tcl.mystery", "com.tcl.stat.analytics", "com.google.android.feedback",
+              "com.google.android.tv.bugreportsender", "com.google.android.katniss", STOCK, WRAITH,
+              "com.google.android.tvrecommendations", "com.netflix.ninja"]
+    return {"system": system, "user": ["com.google.android.youtube.tv", "org.xbmc.kodi"],
+            "disabled": [], "settings": {}, "pref_home": None, "resumed": STOCK + "/.home.HomeActivity",
+            "break_on": os.environ.get("MOCK_BREAK_ON", "")}
+
+def save(s): json.dump(s, open(ST, "w"))
+
+def enabled(s): return [p for p in s["system"] + s["user"] if p not in s["disabled"]]
+
+def home(s):
+    if s["pref_home"] and s["pref_home"].split("/")[0] in enabled(s):
+        return s["pref_home"]
+    for p in (STOCK,):
+        if p in enabled(s): return p + "/.home.HomeActivity"
+    return None
+
+def shell(s, cmd):
+    m = re.match(r"getprop (\S+)", cmd)
+    if m:
+        return {"ro.product.brand": "TCL", "ro.product.model": "G07", "ro.product.device": "g07",
+                "ro.build.version.release": "12", "ro.build.version.sdk": "31"}.get(m.group(1), "") + "\n"
+    if cmd == "getprop": return "[ro.product.brand]: [TCL]\n"
+    if cmd == "echo ok": return "ok\n"
+    if cmd.startswith("pm list packages"):
+        flag = cmd.split()[3]
+        if flag in ("-u",): pk = s["system"] + s["user"]
+        elif flag == "-e": pk = enabled(s)
+        elif flag == "-d": pk = s["disabled"]
+        elif flag == "-s": pk = s["system"]
+        elif flag == "-3": pk = s["user"]
+        else: pk = []
+        return "".join(f"package:{p}\n" for p in pk)
+    m = re.match(r"pm disable-user --user 0 (\S+)", cmd)
+    if m:
+        p = m.group(1)
+        if p not in s["system"] + s["user"]: return "Unknown package\n"
+        if p not in s["disabled"]: s["disabled"].append(p)
+        return f"Package {p} new state: disabled-user\n"
+    m = re.match(r"pm enable (\S+)", cmd)
+    if m:
+        p = m.group(1)
+        if p in s["disabled"]: s["disabled"].remove(p)
+        return f"Package {p} new state: enabled\n"
+    m = re.match(r"settings get (\S+) (\S+)", cmd)
+    if m: return s["settings"].get(m.group(1) + "/" + m.group(2), "null") + "\n"
+    m = re.match(r"settings put (\S+) (\S+) (\S+)", cmd)
+    if m: s["settings"][m.group(1) + "/" + m.group(2)] = m.group(3); return ""
+    m = re.match(r"settings delete (\S+) (\S+)", cmd)
+    if m: s["settings"].pop(m.group(1) + "/" + m.group(2), None); return "Deleted 1 rows\n"
+    if cmd.startswith("settings list"): return "".join(f"{k}={v}\n" for k, v in s["settings"].items())
+    if cmd == "cat /proc/meminfo":
+        avail = 700 - 12 * len(s["disabled"])
+        return f"MemTotal: 2000000 kB\nMemFree: 300000 kB\nMemAvailable: {avail * 1024} kB\n"
+    if cmd.startswith("cmd package resolve-activity"):
+        h = home(s)
+        return "priority=0 preferredOrder=0 match=0x108000 isDefault=true\n" + h + "\n" if h else "No activity found\n"
+    m = re.match(r"cmd package set-home-activity (\S+)", cmd)
+    if m: s["pref_home"] = m.group(1); return "Success\n"
+    if cmd.startswith("dumpsys activity activities"):
+        return f"  mResumedActivity: ActivityRecord{{1a2b u0 {s['resumed']} t12}}\n"
+    if cmd.startswith("am start -a android.settings.SETTINGS"):
+        s["resumed"] = "com.android.tv.settings/.MainSettings"; return "Starting\n"
+    m = re.match(r"am start -n (\S+)", cmd)
+    if m: s["resumed"] = m.group(1); return "Starting\n"
+    m = re.match(r"monkey -p (\S+)", cmd)
+    if m: s["resumed"] = m.group(1) + "/.Main"; return "Events injected: 1\n"
+    if cmd.startswith("input keyevent KEYCODE_HOME"):
+        # real-world quirk: with the setup wizard enabled, Home goes to the stock launcher
+        s["resumed"] = (STOCK + "/.home.HomeActivity") if WRAITH in enabled(s) else (home(s) or "none/none")
+        return ""
+    if cmd.startswith("rm "): return ""
+    return "mock: unhandled " + cmd + "\n"
+
+def main():
+    a = sys.argv[1:]
+    s = load()
+    if a[:1] == ["connect"]:
+        print("connected to " + a[1]); return
+    if a[:1] == ["mdns"]:
+        print("List of discovered mdns services"); return
+    if a[:2] and a[0] == "-s":
+        a = a[2:]
+    op = a[0]
+    if op == "get-state": print("device")
+    elif op == "shell":
+        out = shell(s, " ".join(a[1:]))
+        if s.get("break_on") and s["break_on"] in s["disabled"]:
+            s["pref_home"] = None; s["system"] = [p for p in s["system"] if p != STOCK]  # TV now has no home app
+        sys.stdout.write(out)
+    elif op == "exec-out":
+        sys.stdout.buffer.write(b"\x89PNG\r\n\x1a\n" + bytes(random.getrandbits(8) for _ in range(40000)))
+    elif op == "install":
+        if "com.tvdock.home" not in s["user"]: s["user"].append("com.tvdock.home")
+        print("Performing Streamed Install\nSuccess")
+    elif op == "uninstall":
+        s["user"] = [p for p in s["user"] if p != a[1]]; print("Success")
+    elif op == "reboot": pass
+    elif op == "push": print("1 file pushed")
+    save(s)
+
+main()
